@@ -93,19 +93,6 @@ server when debugging but run under FCGI in production::
     {% endif %}
  
 
-For more flexibility, django-supervisor also supports per-application config
-files.  For each application in INSTALLED_APPS, it will search for config
-files in the following locations:
-
-   * <app directory>/management/supervisord.conf
-   * djsupervisor/contrib/<app name>/supervisord.conf
-
-Any files so found will be merged together, and then merged with your project
-configuration to produce the final supervisord config.  This allows you to
-include basic process management definitions as part of a reusable Django
-application, and tweak or override them on a per-project basis.
-
-
 Usage
 -----
 
@@ -174,6 +161,23 @@ For details of all the available management commands, consult the supervisord
 documentation.
 
 
+Command-Line Options
+~~~~~~~~~~~~~~~~~~~~
+
+The "supervisor" command accepts the following options:
+
+  --daemonize             run the supervisord process in the background
+  --pidfile               store PID of supervisord process in this file
+  --loggile               write supervisord logs to this file
+  --project-dir           use this as the django project directory
+  --launch=program        launch program automatically at supervisor startup
+  --nolaunch=program      don't launch program automatically at startup
+  --exclude=program       remove program from the supervisord config
+  --include=program       include program in the supervisord config
+  --autoreload=program    restart program when code files change
+  --noreload              don't restart programs when code files change
+
+
 Extra Goodies
 -------------
 
@@ -187,21 +191,21 @@ Templating
 All supervisord.conf files are rendered through Django's templating system.
 This allows you to interpolate values from the settings or environment, and
 conditionally switch processes on or off.  The template context for each
-configuration file contains the following variables:
+configuration file contains the following variables::
 
-    :PROJECT_DIR:          the top-level directory of your project (i.e. the
-                           directory containing your manage.py script).
+    PROJECT_DIR          the top-level directory of your project (i.e. the
+                         directory containing your manage.py script).
 
-    :APP_DIR:              for app-provided config files, the top-level
-                           directory containing the application code.
+    APP_DIR              for app-provided config files, the top-level
+                         directory containing the application code.
 
-    :PYTHON:               full path to the current python interpreter.
+    PYTHON               full path to the current python interpreter.
 
-    :SUPERVISOR_OPTIONS:   the command-line options passed to manage.py. 
+    SUPERVISOR_OPTIONS   the command-line options passed to manage.py. 
  
-    :settings:             the Django settings module, as seen by your code.
+    settings             the Django settings module, as seen by your code.
 
-    :environ:              the os.environ dict, as seen by your code.
+    environ              the os.environ dict, as seen by your code.
 
 
 
@@ -235,9 +239,8 @@ Here's an example config file that shows them all in action::
     [program:__overrides__]
     user=nobody
 
-    ; Django-supervisord ships with a default configuration for celerybeat.
-    ; We don't use it, so remove it from the config.
-    [program:celerybeat]
+    ; Disable auto-reloading on code changes by excluding that program.
+    [program:autoreload]
     exclude=true
 
 
@@ -280,6 +283,12 @@ option to supervisor or just exclude it in your project config file like so::
 
     [program:autoreload]
     exclude=true
+
+Optionally, the file patterns on which autoreload listens for changes can
+be set in your project's settings.py:
+
+    SUPERVISOR_AUTORELOAD_PATTERNS = ["*.py", "*.pyc", "*.pyo"]
+    SUPERVISOR_AUTORELOAD_IGNORE_PATTERNS = [".*", "#*", "*~"]
 
 
 

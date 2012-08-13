@@ -46,7 +46,7 @@ URL="http://github.com/rfk/django-supervisor"
 LICENSE = "MIT"
 KEYWORDS = "django supervisord process"
 PACKAGES = ["djsupervisor","djsupervisor.management",
-            "djsupervisor.management.commands"]
+            "djsupervisor.management.commands", "djsupervisor.templatetags"]
 PACKAGE_DATA = {
   "djsupervisor": ["contrib/*/supervisord.conf",],
 }
@@ -74,6 +74,7 @@ setup(
   classifiers=CLASSIFIERS,
   install_requires=[
     "supervisor",
+    "watchdog",
   ],
   **setup_kwds
 )

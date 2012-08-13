@@ -43,9 +43,6 @@ Django's management scripts you gain several advantages:
     * You get auto-reloading for *all* processes when running in debug mode.
     * Process configuration can depend on Django settings and environment
       variables, and have paths relative to your project and/or apps.
-    * Apps can provide default process configurations, which projects can
-      then tweak or override as needed.
-
 
 
 Configuration
@@ -92,19 +89,6 @@ server when debugging but run under FCGI in production::
     command={{ PYTHON }} {{ PROJECT_DIR }}/manage.py runfcgi host=127.0.0.1 port=8025
     {% endif %}
  
-
-For more flexibility, django-supervisor also supports per-application config
-files.  For each application in INSTALLED_APPS, it will search for config
-files in the following locations:
-
-   * <app directory>/management/supervisord.conf
-   * djsupervisor/contrib/<app name>/supervisord.conf
-
-Any files so found will be merged together, and then merged with your project
-configuration to produce the final supervisord config.  This allows you to
-include basic process management definitions as part of a reusable Django
-application, and tweak or override them on a per-project basis.
-
 
 Usage
 -----
@@ -174,6 +158,23 @@ For details of all the available management commands, consult the supervisord
 documentation.
 
 
+Command-Line Options
+~~~~~~~~~~~~~~~~~~~~
+
+The "supervisor" command accepts the following options:
+
+  --daemonize             run the supervisord process in the background
+  --pidfile               store PID of supervisord process in this file
+  --loggile               write supervisord logs to this file
+  --project-dir           use this as the django project directory
+  --launch=program        launch program automatically at supervisor startup
+  --nolaunch=program      don't launch program automatically at startup
+  --exclude=program       remove program from the supervisord config
+  --include=program       include program in the supervisord config
+  --autoreload=program    restart program when code files change
+  --noreload              don't restart programs when code files change
+
+
 Extra Goodies
 -------------
 
@@ -187,22 +188,32 @@ Templating
 All supervisord.conf files are rendered through Django's templating system.
 This allows you to interpolate values from the settings or environment, and
 conditionally switch processes on or off.  The template context for each
-configuration file contains the following variables:
+configuration file contains the following variables::
 
-    :PROJECT_DIR:          the top-level directory of your project (i.e. the
-                           directory containing your manage.py script).
+    PROJECT_DIR          the top-level directory of your project (i.e. the
+                         directory containing your manage.py script).
 
-    :APP_DIR:              for app-provided config files, the top-level
-                           directory containing the application code.
+    APP_DIR              for app-provided config files, the top-level
+                         directory containing the application code.
 
-    :PYTHON:               full path to the current python interpreter.
+    PYTHON               full path to the current python interpreter.
 
-    :SUPERVISOR_OPTIONS:   the command-line options passed to manage.py. 
+    SUPERVISOR_OPTIONS   the command-line options passed to manage.py. 
  
-    :settings:             the Django settings module, as seen by your code.
+    settings             the Django settings module, as seen by your code.
 
-    :environ:              the os.environ dict, as seen by your code.
+    environ              the os.environ dict, as seen by your code.
 
+If your project has other configuration files that need to interpolate these
+values, you can refer to them via the "templated" filter, like this::
+
+    [program:nginx]
+    command=nginx -c {{ "nginx.conf"|templated }}
+
+The file path is relative to your project directory.  Django-supervisor will
+read the specified file, pass it through its templating logic, write out a
+matching "nginx.conf.templated" file, and insert the path to this file as the
+result of the filter.
 
 
 Defaults, Overrides and Excludes
@@ -235,9 +246,8 @@ Here's an example config file that shows them all in action::
     [program:__overrides__]
     user=nobody
 
-    ; Django-supervisord ships with a default configuration for celerybeat.
-    ; We don't use it, so remove it from the config.
-    [program:celerybeat]
+    ; Don't reload programs when python code changes.
+    [program:autoreload]
     exclude=true
 
 
@@ -281,20 +291,11 @@ option to supervisor or just exclude it in your project config file like so::
     [program:autoreload]
     exclude=true
 
-
-
-More Info
----------
-
-There aren't any more docs online yet.  Sorry.  I'm working on a little tutorial
-and some examples, but I need to actually *use* the project a little more
-first to make sure it all fits together the way I want...
-
 """
 
 __ver_major__ = 0
-__ver_minor__ = 2
-__ver_patch__ = 3
+__ver_minor__ = 3
+__ver_patch__ = 0
 __ver_sub__ = ""
 __version__ = "%d.%d.%d%s" % (__ver_major__,__ver_minor__,__ver_patch__,__ver_sub__)
 

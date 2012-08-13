@@ -22,14 +22,14 @@ The "supervisor" command suports several modes of operation:
 
 """
 
-from __future__ import absolute_import
-from __future__ import with_statement
+from __future__ import absolute_import, with_statement
 
 import sys
 import os
 import time
 from optparse import make_option
 from textwrap import dedent
+import traceback
 from ConfigParser import RawConfigParser, NoOptionError
 try:
     from cStringIO import StringIO
@@ -38,10 +38,19 @@ except ImportError:
 
 from supervisor import supervisord, supervisorctl
 
+from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver
+
 from django.core.management.base import BaseCommand, CommandError
+from django.conf import settings
 
 from djsupervisor.config import get_merged_config
+from djsupervisor.events import CallbackModifiedHandler
 
+AUTORELOAD_PATTERNS = getattr(settings, "SUPERVISOR_AUTORELOAD_PATTERNS",
+                              ['*.py'])
+AUTORELOAD_IGNORE = getattr(settings, "SUPERVISOR_AUTORELOAD_IGNORE_PATTERNS", 
+                            [".*", "#*", "*~"])
 
 class Command(BaseCommand):
 
@@ -55,6 +64,7 @@ class Command(BaseCommand):
            With a command argument it lets you control the running processes.
            Available commands include:
 
+               supervisor getconfig
                supervisor shell
                supervisor start <progname>
                supervisor stop <progname>
@@ -78,6 +88,19 @@ class Command(BaseCommand):
             action="store",
             dest="logfile",
             help="write logging output to this file"
+        ),
+        make_option("--project-dir",None,
+            action="store",
+            dest="project_dir",
+            help="the root directory for the django project"
+                 " (by default this is guessed from the location"
+                 " of manage.py)"
+        ),
+        make_option("--config-file",None,
+            action="store",
+            dest="config_file",
+            help="the supervisord configuration file to load"
+                 " (by default this is <project-dir>/supervisord.conf)"
         ),
         make_option("--launch","-l",
             metavar="PROG",
@@ -145,18 +168,18 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         #  We basically just construct the merged supervisord.conf file
         #  and forward it on to either supervisord or supervisorctl.
-        cfg = get_merged_config(**options)
         #  Due to some very nice engineering on behalf of supervisord authors,
         #  you can pass it a StringIO instance for the "-c" command-line
         #  option.  Saves us having to write the config to a tempfile.
-        cfg_file = StringIO(cfg)
+        cfg_file = OnDemandStringIO(get_merged_config, **options)
         #  With no arguments, we launch the processes under supervisord.
         if not args:
             return supervisord.main(("-c",cfg_file))
         #  With arguments, the first arg specifies the sub-command
         #  Some commands we implement ourself with _handle_<command>.
         #  The rest we just pass on to supervisorctl.
-        assert args[0].isalnum()
+        if not args[0].isalnum():
+            raise ValueError("Unknown supervisor command: %s" % (args[0],))
         methname = "_handle_%s" % (args[0],)
         try:
             method = getattr(self,methname)
@@ -175,14 +198,14 @@ class Command(BaseCommand):
         return supervisorctl.main(("-c",cfg_file) + args)
 
     def _handle_getconfig(self,cfg_file,*args,**options):
-        """Command 'supervisord getconfig' prints merged config to stdout."""
+        """Command 'supervisor getconfig' prints merged config to stdout."""
         if args:
-            raise CommandError("supervisord getconfig takes no arguments")
-        print cfg_file.getvalue()
+            raise CommandError("supervisor getconfig takes no arguments")
+        print cfg_file.read()
         return 0
 
     def _handle_autoreload(self,cfg_file,*args,**options):
-        """Command 'supervisord autoreload' watches for code changes.
+        """Command 'supervisor autoreload' watches for code changes.
 
         This command provides a simulation of the Django dev server's
         auto-reloading mechanism that will restart all supervised processes.
@@ -193,18 +216,59 @@ class Command(BaseCommand):
         that are "nearby" the files loaded at startup by Django.
         """
         if args:
-            raise CommandError("supervisord autoreload takes no arguments")
+            raise CommandError("supervisor autoreload takes no arguments")
         live_dirs = self._find_live_code_dirs()
-        mtimes = {}
         reload_progs = self._get_autoreload_programs(cfg_file)
-        while True:
-            if self._code_has_changed(live_dirs,mtimes):
-                #  Fork a subprocess to make the restart call.
-                #  Otherwise supervisord might kill us and cancel the restart!
-                if os.fork() == 0:
-                    self.handle("restart",*reload_progs,**options)
-                return 0
-            time.sleep(1)
+
+        def autoreloader():
+            """
+            Forks a subprocess to make the restart call.
+            Otherwise supervisord might kill us and cancel the restart!
+            """
+            if os.fork() == 0:
+                sys.exit(self.handle("restart", *reload_progs, **options))
+
+        # Call the autoreloader callback whenever a .py file changes.
+        # To prevent thrashing, limit callbacks to one per second.
+        handler = CallbackModifiedHandler(callback=autoreloader,
+                                          repeat_delay=1,
+                                          patterns=AUTORELOAD_PATTERNS,
+                                          ignore_patterns=AUTORELOAD_IGNORE,
+                                          ignore_directories=True)
+
+        # Try to add watches using the platform-specific observer.
+        # If this fails, print a warning and fall back to the PollingObserver.
+        # This will avoid errors with e.g. too many inotify watches.
+        observer = None
+        for ObserverCls in (Observer, PollingObserver):
+            observer = ObserverCls()
+            try:
+                for live_dir in set(live_dirs):
+                    observer.schedule(handler, live_dir, True)
+                break
+            except Exception:
+                print>>sys.stderr, "COULD NOT WATCH FILESYSTEM USING"
+                print>>sys.stderr, "OBSERVER CLASS: ", ObserverCls
+                traceback.print_exc()
+                observer.start()
+                observer.stop()
+
+        # Fail out if none of the observers worked.
+        if observer is None:
+            print>>sys.stderr, "COULD NOT WATCH FILESYSTEM"
+            return 1
+
+        # Poll if we have an observer.
+        # TODO: Is this sleep necessary?  Or will it suffice
+        # to block indefinitely on something and wait to be killed?
+        observer.start()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            observer.stop()
+        observer.join()
+        return 0
 
     def _get_autoreload_programs(self,cfg_file):
         """Get the set of programs to auto-reload when code changes.
@@ -225,29 +289,12 @@ class Command(BaseCommand):
                     pass
         return reload_progs
 
-    def _code_has_changed(self,live_dirs,mtimes):
-        """Check whether code under the given directories has changed.
-
-        This is a simple check based on file mtime.  New or deleted files
-        don't count as code changes.
-        """
-        for filepath in self._find_live_code_files(live_dirs):
-            try:
-                stat = os.stat(filepath)
-            except EnvironmentError:
-                continue
-            if filepath not in mtimes:
-                mtimes[filepath] = stat.st_mtime
-            else:
-                if mtimes[filepath] != stat.st_mtime:
-                    return True
-
     def _find_live_code_dirs(self):
         """Find all directories in which we might have live python code.
 
         This walks all of the currently-imported modules and adds their
         containing directory to the list of live dirs.  After normalization
-        and de-duplication, we get a pretty good approximation of the 
+        and de-duplication, we get a pretty good approximation of the
         directories on sys.path that are actively in use.
         """
         live_dirs = []
@@ -270,26 +317,43 @@ class Command(BaseCommand):
                 if dirnm.startswith(dirnm2):
                     break
             else:
-                #  Remove any one's we've found that are subdirs of it.
+                #  Remove any ones we've found that are subdirs of it.
                 live_dirs = [dirnm2 for dirnm2 in live_dirs\
                                     if not dirnm2.startswith(dirnm)]
                 live_dirs.append(dirnm)
         return live_dirs
 
-    def _find_live_code_files(self,live_dirs):
-        """Find live python code files, that must be watched for changes.
 
-        Given a pre-computed list of directories in which to search, this
-        method finds all the python files under those directories and yields
-        their full paths.
-        """
-        for dirnm in live_dirs:
-            for (subdirnm,_,filenms) in os.walk(dirnm):
-                for filenm in filenms:
-                    try:
-                        filebase,ext = filenm.rsplit(".",1)
-                    except ValueError:
-                        continue
-                    if ext in ("py","pyc","pyo",):
-                        yield os.path.join(subdirnm,filebase+".py")
+class OnDemandStringIO(object):
+    """StringIO standin that demand-loads its contents and resets on EOF.
 
+    This class is a little bit of a hack to make supervisord reloading work
+    correctly.  It provides the readlines() method expected by supervisord's
+    config reader, but it resets itself after indicating end-of-file.  If
+    the supervisord process then SIGHUPs and tries to read the config again,
+    it will be re-created and available for updates.
+    """
+
+    def __init__(self, callback, *args, **kwds):
+        self._fp = None
+        self.callback = callback
+        self.args = args
+        self.kwds = kwds
+
+    @property
+    def fp(self):
+        if self._fp is None:
+            self._fp = StringIO(self.callback(*self.args, **self.kwds))
+        return self._fp
+
+    def read(self, *args, **kwds):
+        data = self.fp.read(*args, **kwds)
+        if not data:
+            self._fp = None
+        return data
+
+    def readline(self, *args, **kwds):
+        line = self.fp.readline(*args, **kwds)
+        if not line:
+            self._fp = None
+        return line

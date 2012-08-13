@@ -24,32 +24,35 @@ from ConfigParser import RawConfigParser, NoSectionError, NoOptionError
 from django import template
 from django.conf import settings
 from django.utils.importlib import import_module
- 
 
-CONFIG_FILE_NAME = "supervisord.conf"
+from djsupervisor.templatetags import djsupervisor_tags
+
+CONFIG_FILE = getattr(settings, "SUPERVISOR_CONFIG_FILE", "supervisord.conf")
 
 
 def get_merged_config(**options):
     """Get the final merged configuration for supvervisord, as a string.
 
-    This is the top-level function exported by this module.  It collects
-    the various config files from installed applications and the main project,
-    combines them together based on priority, and returns the resulting
-    configuration as a string.
+    This is the top-level function exported by this module.  It combines
+    the config file from the main project with default settings and those
+    specified in the command-line, processes various special section names,
+    and returns the resulting configuration as a string.
     """
     #  Find and load the containing project module.
-    #  This is assumed to be the top-level package containing settings module.
-    #  If it doesn't contain a manage.py script, we're in trouble.
-    projname = settings.SETTINGS_MODULE.split(".",1)[0]
-    projmod = import_module(projname)
-    projdir = os.path.dirname(projmod.__file__)
-    if not os.path.isfile(os.path.join(projdir,"manage.py")):
-        msg = "Project %s doesn't have a ./manage.py" % (projname,)
-        raise RuntimeError(msg)
+    #  This can be specified explicity using the --project-dir option.
+    #  Otherwise, we attempt to guess by looking for the manage.py file.
+    project_dir = options.get("project_dir")
+    if project_dir is None:
+        project_dir = guess_project_dir()
+    # Find the config file to load.
+    # Default to <project-dir>/supervisord.conf.
+    config_file = options.get("config_file")
+    if config_file is None:
+        config_file = os.path.join(project_dir,CONFIG_FILE)
     #  Build the default template context variables.
     #  This is mostly useful information about the project and environment.
     ctx = {
-        "PROJECT_DIR": projdir,
+        "PROJECT_DIR": project_dir,
         "PYTHON": os.path.realpath(os.path.abspath(sys.executable)),
         "SUPERVISOR_OPTIONS": rerender_options(options),
         "settings": settings,
@@ -63,15 +66,10 @@ def get_merged_config(**options):
     #  Start from the default configuration options.
     data = render_config(DEFAULT_CONFIG,ctx)
     cfg.readfp(StringIO(data))
-    #  Add in each app-specific file in turn.
-    for data in find_app_configs(ctx,projmod):
-        cfg.readfp(StringIO(data))
     #  Add in the project-specific config file.
-    projcfg = os.path.join(projdir,CONFIG_FILE_NAME)
-    if os.path.isfile(projcfg):
-        with open(projcfg,"r") as f:
-            data = render_config(f.read(),ctx)
-        cfg.readfp(StringIO(data))
+    with open(config_file,"r") as f:
+        data = render_config(f.read(),ctx)
+    cfg.readfp(StringIO(data))
     #  Add in the options specified on the command-line.
     cfg.readfp(StringIO(get_config_from_options(**options)))
     #  Add options from [program:__defaults__] to each program section
@@ -146,51 +144,11 @@ def render_config(data,ctx):
     This function takes a config data string and a dict of context variables,
     renders the data through Django's template system, and returns the result.
     """
+    djsupervisor_tags.current_context = ctx
+    data = "{% load djsupervisor_tags %}" + data
     t = template.Template(data)
     c = template.Context(ctx)
     return t.render(c).encode("ascii")
-
-
-def find_app_configs(ctx,projmod):
-    """Generator yielding app-provided config file data.
-
-    This function searches for supervisord config files within each of the
-    installed apps, in the order they are listed in INSTALLED_APPS.  Each
-    file found is rendered and the resulting contents yielded as a string.
-
-    If the app ships with a management/supervisord.conf file, then that file
-    is used.  Otherwise, we look for one under the djsupervisor "contrib"
-    directory.  Only one of the two files is used, to prevent us from 
-    clobbering settings specified by app authors.
-    """
-    contrib_dir = os.path.join(os.path.dirname(__file__),"contrib")
-    for appname in settings.INSTALLED_APPS:
-        appfile = None
-        #  Look first in the application directory.
-        appmod = import_module(appname)
-        try:
-            appdir = os.path.dirname(appmod.__file__)
-        except AttributeError:
-            pass
-        else:
-            appfile = os.path.join(appdir,"management",CONFIG_FILE_NAME)
-            if not os.path.isfile(appfile):
-                appfile = None
-        #  If that didn't work, try the djsupervisor contrib directory
-        if appfile is None:
-            appdir = os.path.join(contrib_dir,appname.replace(".",os.sep))
-            appfile = os.path.join(appdir,CONFIG_FILE_NAME)
-            if not os.path.isfile(appfile):
-                appfile = None
-        #  If we found one, render and yield it.
-        if appfile is not None:
-            #  Add extra context info about the application.
-            app_ctx = {
-                "APP_DIR": os.path.dirname(appmod.__file__),
-            }
-            app_ctx.update(ctx)
-            with open(appfile,"r") as f:
-                yield render_config(f.read(),app_ctx)
 
 
 def get_config_from_options(**options):
@@ -231,6 +189,33 @@ def get_config_from_options(**options):
     return "".join(data)
 
 
+def guess_project_dir():
+    """Find the top-level Django project directory.
+
+    This function guesses the top-level Django project directory based on
+    the current environment.  It looks for module containing the currently-
+    active settings module, in both pre-1.4 and post-1.4 layours.
+    """
+    projname = settings.SETTINGS_MODULE.split(".",1)[0]
+    projmod = import_module(projname)
+    projdir = os.path.dirname(projmod.__file__)
+
+    # For Django 1.3 and earlier, the manage.py file was located
+    # in the same directory as the settings file.
+    if os.path.isfile(os.path.join(projdir,"manage.py")):
+        return projdir
+
+    # For Django 1.4 and later, the manage.py file is located in
+    # the directory *containing* the settings file.
+    projdir = os.path.abspath(os.path.join(projdir, os.path.pardir))
+    if os.path.isfile(os.path.join(projdir,"manage.py")):
+        return projdir
+
+    msg = "Unable to determine the Django project directory;"\
+          " use --project-dir to specify it"
+    raise RuntimeError(msg)
+
+
 def set_if_missing(cfg,section,option,value):
     """If the given option is missing, set to the given value."""
     try:
@@ -250,6 +235,7 @@ def rerender_options(options):
     """
     args = []
     for name,value in options.iteritems():
+        name = name.replace("_","-")
         if value is None:
             pass
         elif isinstance(value,bool):
@@ -266,10 +252,6 @@ def rerender_options(options):
 #  These are the default configuration options provided by djsupervisor.
 #
 DEFAULT_CONFIG = """
-
-;  We always provide the 'runserver' process to run the dev server.
-[program:runserver]
-command={{ PYTHON }} {{ PROJECT_DIR }}/manage.py runserver --noreload
 
 ;  In debug mode, we watch for changes in the project directory and inside
 ;  any installed apps.  When something changes, restart all processes.
@@ -290,6 +272,4 @@ redirect_stderr=true
 loglevel=debug
 {% endif %}
 
-
 """
-
